@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import re
@@ -54,8 +55,8 @@ class TestMain(unittest.TestCase):
         body = serialize_mail(mail)
         body_map = {k: v for k, v in body}
         manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
-        self.assertTrue(
-            manifest["headers"]["auto_reply_type"], "disposition-notification"
+        self.assertEqual(
+            "disposition-notification", manifest["headers"]["auto_reply_type"]
         )
 
     def test_vacation_reply(self):
@@ -63,7 +64,7 @@ class TestMain(unittest.TestCase):
         body = serialize_mail(mail)
         body_map = {k: v for k, v in body}
         manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
-        self.assertTrue(manifest["headers"]["auto_reply_type"], "vacation-reply")
+        self.assertEqual("vacation-reply", manifest["headers"]["auto_reply_type"])
 
     def test_html_only(self):
         mail = get_email_as_bytes("html_only.eml")
@@ -72,6 +73,61 @@ class TestMain(unittest.TestCase):
         manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
         self.assertTrue(manifest["text"]["content"])
         self.assertTrue(manifest["text"]["html_content"])
+
+    def test_auto_reply_type_none(self):
+        """A normal email must not be flagged as an auto-reply."""
+        mail = get_email_as_bytes("html_only.eml")
+        body = serialize_mail(mail)
+        body_map = {k: v for k, v in body}
+        manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
+        self.assertIsNone(manifest["headers"]["auto_reply_type"])
+
+    def test_manifest_headers(self):
+        """Subject, to, from, date, message_id are all parsed from the EML."""
+        mail = get_email_as_bytes("vacation-reply.eml")
+        body = serialize_mail(mail)
+        body_map = {k: v for k, v in body}
+        manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
+        headers = manifest["headers"]
+        self.assertIn("user-b@siecobywatelska.pl", headers["to"])
+        self.assertIn("user-a@siecobywatelska.pl", headers["from"])
+        self.assertEqual("<E1fk6QU-00CPTw-Ey@s50.hekko.net.pl>", headers["message_id"])
+        self.assertTrue(headers["date"].startswith("2018-07-30"))
+
+    def test_attachment_extraction(self):
+        """
+        An EML with one attachment produces files_count=1 and a readable
+        attachment part.
+        """
+        raw = get_email_as_bytes(
+            "Re Wniosek o informację dot. publikacji rejestru umów.eml"
+        )
+        parts = serialize_mail(raw)
+        manifest = json.loads(
+            next(v for k, v in parts if k == "manifest")[1].read().decode("utf-8")
+        )
+        self.assertEqual(1, manifest["files_count"])
+
+        attachments = [(k, v) for k, v in parts if k == "attachment"]
+        self.assertEqual(1, len(attachments))
+        filename, content_io, _mime = attachments[0][1]
+        self.assertEqual("OR.1434.76.2025 fedrowanie.pdf", filename)
+        self.assertGreater(len(content_io.read()), 0)
+
+    def test_eml_compression(self):
+        """
+        compress_eml=True produces a gzip-compressed eml that round-trips
+        to the original.
+        """
+        raw = get_email_as_bytes("vacation-reply.eml")
+        parts = serialize_mail(raw, compress_eml=True)
+        body_map = {k: v for k, v in parts}
+        manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
+
+        self.assertTrue(manifest["eml"]["compressed"])
+        eml_filename, eml_io, _mime = body_map["eml"]
+        self.assertTrue(eml_filename.endswith(".eml.gz"))
+        self.assertEqual(raw, gzip.decompress(eml_io.read()))
 
     def test_get_delimiter(self):
         self.assertEqual("\r\n", text.get_delimiter("abc\r\n123"))
@@ -1424,6 +1480,36 @@ that this line is intact."""
             from_list,
             "Expected sender address not found in parsed 'from' list",
         )
+
+    def test_outlook_forwarded_with_inline_images(self):
+        """
+        Real-world Outlook forward: reply text is separated from the quoted
+        forward block, and inline images are surfaced as attachments.
+        """
+        raw = get_email_as_bytes("Fw_ CloudHosting Enterprise dla biznesu.eml")
+        parts = serialize_mail(raw)
+        manifest = json.loads(
+            next(v for k, v in parts if k == "manifest")[1].read().decode("utf-8")
+        )
+        h = manifest["headers"]
+
+        self.assertEqual("test.user@company.eu", h["from"][0])
+        self.assertIn("test.user@gmail.com", h["to"])
+        self.assertEqual("Fw: CloudHosting Enterprise dla biznesu", h["subject"])
+        self.assertIsNone(h["auto_reply_type"])
+
+        # three inline images treated as attachments
+        self.assertEqual(3, manifest["files_count"])
+        attachments = [(k, v) for k, v in parts if k == "attachment"]
+        self.assertEqual(3, len(attachments))
+        filenames = [v[0] for _, v in attachments]
+        self.assertIn("attachment_0.jpg", filenames)
+
+        # Outlook forward quote is detected; reply body is separated
+        text = manifest["text"]
+        self.assertIn("Pozdrawiam", text["content"])
+        self.assertNotIn("Pozdrawiam", text["quote"])
+        self.assertIn("nazwa.pl", text["quote"])
 
 
 if __name__ == "__main__":
