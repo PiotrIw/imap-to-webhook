@@ -95,7 +95,10 @@ class TestMain(unittest.TestCase):
         self.assertTrue(headers["date"].startswith("2018-07-30"))
 
     def test_attachment_extraction(self):
-        """An EML with one attachment produces files_count=1 and a readable attachment part."""
+        """
+        An EML with one attachment produces files_count=1 and a readable
+        attachment part.
+        """
         raw = get_email_as_bytes(
             "Re Wniosek o informację dot. publikacji rejestru umów.eml"
         )
@@ -112,7 +115,10 @@ class TestMain(unittest.TestCase):
         self.assertGreater(len(content_io.read()), 0)
 
     def test_eml_compression(self):
-        """compress_eml=True produces a gzip-compressed eml that round-trips to the original."""
+        """
+        compress_eml=True produces a gzip-compressed eml that round-trips
+        to the original.
+        """
         raw = get_email_as_bytes("vacation-reply.eml")
         parts = serialize_mail(raw, compress_eml=True)
         body_map = {k: v for k, v in parts}
@@ -1474,7 +1480,6 @@ that this line is intact."""
             from_list,
             "Expected sender address not found in parsed 'from' list",
         )
-
 
     def test_outlook_forwarded_with_inline_images(self):
         """
