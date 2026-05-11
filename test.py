@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import re
@@ -54,8 +55,8 @@ class TestMain(unittest.TestCase):
         body = serialize_mail(mail)
         body_map = {k: v for k, v in body}
         manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
-        self.assertTrue(
-            manifest["headers"]["auto_reply_type"], "disposition-notification"
+        self.assertEqual(
+            "disposition-notification", manifest["headers"]["auto_reply_type"]
         )
 
     def test_vacation_reply(self):
@@ -63,7 +64,7 @@ class TestMain(unittest.TestCase):
         body = serialize_mail(mail)
         body_map = {k: v for k, v in body}
         manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
-        self.assertTrue(manifest["headers"]["auto_reply_type"], "vacation-reply")
+        self.assertEqual("vacation-reply", manifest["headers"]["auto_reply_type"])
 
     def test_html_only(self):
         mail = get_email_as_bytes("html_only.eml")
@@ -72,6 +73,61 @@ class TestMain(unittest.TestCase):
         manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
         self.assertTrue(manifest["text"]["content"])
         self.assertTrue(manifest["text"]["html_content"])
+
+    def test_auto_reply_type_none(self):
+        """A normal email must not be flagged as an auto-reply."""
+        mail = get_email_as_bytes("html_only.eml")
+        body = serialize_mail(mail)
+        body_map = {k: v for k, v in body}
+        manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
+        self.assertIsNone(manifest["headers"]["auto_reply_type"])
+
+    def test_manifest_headers(self):
+        """Subject, to, from, date, message_id are all parsed from the EML."""
+        mail = get_email_as_bytes("vacation-reply.eml")
+        body = serialize_mail(mail)
+        body_map = {k: v for k, v in body}
+        manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
+        headers = manifest["headers"]
+        self.assertIn("user-b@siecobywatelska.pl", headers["to"])
+        self.assertIn("user-a@siecobywatelska.pl", headers["from"])
+        self.assertEqual("<E1fk6QU-00CPTw-Ey@s50.hekko.net.pl>", headers["message_id"])
+        self.assertTrue(headers["date"].startswith("2018-07-30"))
+
+    def test_attachment_extraction(self):
+        """
+        An EML with one attachment produces files_count=1 and a readable
+        attachment part.
+        """
+        raw = get_email_as_bytes(
+            "Re Wniosek o informację dot. publikacji rejestru umów.eml"
+        )
+        parts = serialize_mail(raw)
+        manifest = json.loads(
+            next(v for k, v in parts if k == "manifest")[1].read().decode("utf-8")
+        )
+        self.assertEqual(1, manifest["files_count"])
+
+        attachments = [(k, v) for k, v in parts if k == "attachment"]
+        self.assertEqual(1, len(attachments))
+        filename, content_io, _mime = attachments[0][1]
+        self.assertEqual("OR.1434.76.2025 fedrowanie.pdf", filename)
+        self.assertGreater(len(content_io.read()), 0)
+
+    def test_eml_compression(self):
+        """
+        compress_eml=True produces a gzip-compressed eml that round-trips
+        to the original.
+        """
+        raw = get_email_as_bytes("vacation-reply.eml")
+        parts = serialize_mail(raw, compress_eml=True)
+        body_map = {k: v for k, v in parts}
+        manifest = json.loads(body_map["manifest"][1].read().decode("utf-8"))
+
+        self.assertTrue(manifest["eml"]["compressed"])
+        eml_filename, eml_io, _mime = body_map["eml"]
+        self.assertTrue(eml_filename.endswith(".eml.gz"))
+        self.assertEqual(raw, gzip.decompress(eml_io.read()))
 
     def test_get_delimiter(self):
         self.assertEqual("\r\n", text.get_delimiter("abc\r\n123"))
@@ -589,16 +645,14 @@ Sent from Samsung MobileName <address@example.com> wrote:
     def test_pattern_on_date_wrote_somebody(self):
         self.assertEqual(
             "Lorem",
-            text.extract_non_quoted_from_plain(
-                """Lorem
+            text.extract_non_quoted_from_plain("""Lorem
 
 Op 13-02-2014 3:18 schreef Julius Caesar <pantheon@rome.com>:
 
 Veniam laborum mlkshk kale chips authentic.
 Normcore mumblecore laboris, fanny pack readymade eu blog chia pop-up
 freegan enim master cleanse.
-"""
-            ),
+"""),
         )
 
     def test_pattern_on_date_somebody_wrote_date_with_slashes(self):
@@ -825,8 +879,7 @@ Sent from Acompli"""
     def test_english_from_block(self):
         self.assertEqual(
             "Allo! Follow up MIME!",
-            text.extract_non_quoted_from_plain(
-                """Allo! Follow up MIME!
+            text.extract_non_quoted_from_plain("""Allo! Follow up MIME!
 
 From: somebody@example.com
 Sent: March-19-11 5:42 PM
@@ -834,15 +887,13 @@ To: Somebody
 Subject: The manager has commented on your Loop
 
 Blah-blah-blah
-"""
-            ),
+"""),
         )
 
     def test_german_from_block(self):
         self.assertEqual(
             "Allo! Follow up MIME!",
-            text.extract_non_quoted_from_plain(
-                """Allo! Follow up MIME!
+            text.extract_non_quoted_from_plain("""Allo! Follow up MIME!
 
 Von: somebody@example.com
 Gesendet: Dienstag, 25. November 2014 14:59
@@ -850,15 +901,13 @@ An: Somebody
 Betreff: The manager has commented on your Loop
 
 Blah-blah-blah
-"""
-            ),
+"""),
         )
 
     def test_french_multiline_from_block(self):
         self.assertEqual(
             "Lorem ipsum",
-            text.extract_non_quoted_from_plain(
-                """Lorem ipsum
+            text.extract_non_quoted_from_plain("""Lorem ipsum
 
 De : Brendan xxx [mailto:brendan.xxx@xxx.com]
 Envoyé : vendredi 23 janvier 2015 16:39
@@ -866,42 +915,36 @@ Envoyé : vendredi 23 janvier 2015 16:39
 Objet : Follow Up
 
 Blah-blah-blah
-"""
-            ),
+"""),
         )
 
     def test_french_from_block(self):
         self.assertEqual(
             "Lorem ipsum",
-            text.extract_non_quoted_from_plain(
-                """Lorem ipsum
+            text.extract_non_quoted_from_plain("""Lorem ipsum
 
     Le 23 janv. 2015 à 22:03, Brendan xxx
     <brendan.xxx@xxx.com<mailto:brendan.xxx@xxx.com>> a écrit:
 
-    Bonjour!"""
-            ),
+    Bonjour!"""),
         )
 
     def test_polish_from_block(self):
         self.assertEqual(
             "Lorem ipsum",
-            text.extract_non_quoted_from_plain(
-                """Lorem ipsum
+            text.extract_non_quoted_from_plain("""Lorem ipsum
 
 W dniu 28 stycznia 2015 01:53 użytkownik Zoe xxx <zoe.xxx@xxx.com>
 napisał:
 
 Blah!
-"""
-            ),
+"""),
         )
 
     def test_danish_from_block(self):
         self.assertEqual(
             "Allo! Follow up MIME!",
-            text.extract_non_quoted_from_plain(
-                """Allo! Follow up MIME!
+            text.extract_non_quoted_from_plain("""Allo! Follow up MIME!
 
 Fra: somebody@example.com
 Sendt: 19. march 2011 12:10
@@ -909,51 +952,44 @@ Til: Somebody
 Emne: The manager has commented on your Loop
 
 Blah-blah-blah
-"""
-            ),
+"""),
         )
 
     def test_swedish_from_block(self):
         self.assertEqual(
             "Allo! Follow up MIME!",
-            text.extract_non_quoted_from_plain(
-                """Allo! Follow up MIME!
+            text.extract_non_quoted_from_plain("""Allo! Follow up MIME!
 Från: Anno Sportel [mailto:anno.spoel@hsbcssad.com]
 Skickat: den 26 augusti 2015 14:45
 Till: Isacson Leiff
 Ämne: RE: Week 36
 
 Blah-blah-blah
-"""
-            ),
+"""),
         )
 
     def test_swedish_from_line(self):
         self.assertEqual(
             "Lorem",
-            text.extract_non_quoted_from_plain(
-                """Lorem
+            text.extract_non_quoted_from_plain("""Lorem
 Den 14 september, 2015 02:23:18, Valentino Rudy (valentino@rudy.be) skrev:
 
 Veniam laborum mlkshk kale chips authentic.
 Normcore mumblecore laboris, fanny pack
 readymade eu blog chia pop-up freegan enim master cleanse.
-"""
-            ),
+"""),
         )
 
     def test_norwegian_from_line(self):
         self.assertEqual(
             "Lorem",
-            text.extract_non_quoted_from_plain(
-                """Lorem
+            text.extract_non_quoted_from_plain("""Lorem
 På 14 september 2015 på 02:23:18, Valentino Rudy (valentino@rudy.be) skrev:
 
 Veniam laborum mlkshk kale chips authentic.
 Normcore mumblecore laboris, fanny pack
 readymade eu blog chia pop-up freegan enim master cleanse.
-"""
-            ),
+"""),
         )
 
     def test_dutch_from_block(self):
@@ -973,14 +1009,12 @@ Small batch beard laboris tempor, non listicle hella Tumblr heirloom.
     def test_vietnamese_from_block(self):
         self.assertEqual(
             "Hello",
-            text.extract_non_quoted_from_plain(
-                """Hello
+            text.extract_non_quoted_from_plain("""Hello
 
 Vào 14:24 8 tháng 6, 2017, Hùng Nguyễn <hungnguyen@xxx.com> đã viết:
 
 > Xin chào
-"""
-            ),
+"""),
         )
 
     def test_quotation_marker_false_positive(self):
@@ -1446,6 +1480,36 @@ that this line is intact."""
             from_list,
             "Expected sender address not found in parsed 'from' list",
         )
+
+    def test_outlook_forwarded_with_inline_images(self):
+        """
+        Real-world Outlook forward: reply text is separated from the quoted
+        forward block, and inline images are surfaced as attachments.
+        """
+        raw = get_email_as_bytes("Fw_ CloudHosting Enterprise dla biznesu.eml")
+        parts = serialize_mail(raw)
+        manifest = json.loads(
+            next(v for k, v in parts if k == "manifest")[1].read().decode("utf-8")
+        )
+        h = manifest["headers"]
+
+        self.assertEqual("test.user@company.eu", h["from"][0])
+        self.assertIn("test.user@gmail.com", h["to"])
+        self.assertEqual("Fw: CloudHosting Enterprise dla biznesu", h["subject"])
+        self.assertIsNone(h["auto_reply_type"])
+
+        # three inline images treated as attachments
+        self.assertEqual(3, manifest["files_count"])
+        attachments = [(k, v) for k, v in parts if k == "attachment"]
+        self.assertEqual(3, len(attachments))
+        filenames = [v[0] for _, v in attachments]
+        self.assertIn("attachment_0.jpg", filenames)
+
+        # Outlook forward quote is detected; reply body is separated
+        text = manifest["text"]
+        self.assertIn("Pozdrawiam", text["content"])
+        self.assertNotIn("Pozdrawiam", text["quote"])
+        self.assertIn("nazwa.pl", text["quote"])
 
 
 if __name__ == "__main__":
