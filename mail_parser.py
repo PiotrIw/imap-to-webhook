@@ -1,18 +1,14 @@
-import base64
-import binascii
+import datetime
 import gzip
 import json
-import quopri
 import re
 import uuid
-from email import policy
-from email.header import Header as EmailHeader
+from email.header import decode_header, make_header
 from email.parser import BytesParser
 from email.policy import compat32
-from email.utils import getaddresses
+from email.utils import getaddresses, parsedate, parsedate_to_datetime
 from io import BytesIO
 
-import mailparser
 from email_validator import validate_email
 from html2text import html2text
 
@@ -21,14 +17,6 @@ from extract_raw_content.text import (
     exctract_quoted_from_plain,
     extract_non_quoted_from_plain,
 )
-
-decoder_map = {
-    "base64": base64.b64decode,
-    "": lambda payload: payload.encode("utf-8"),
-    "7bit": lambda payload: payload.encode("utf-8"),
-    "8bit": lambda payload: payload.encode("utf-8"),
-    "quoted-printable": quopri.decodestring,
-}
 
 JSON_MIME = "application/json"
 GZ_MIME = "application/gzip"
@@ -105,6 +93,118 @@ def extract_emails(source):
     return [x for x in normalized if x]
 
 
+def _str_header(value) -> str:
+    """Decode an RFC2047 encoded header value to a plain Unicode string."""
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+
+def _addr_list(msg, name: str):
+    """Return list of (display_name, email) tuples for an address header."""
+    return getaddresses(msg.get_all(name) or [])
+
+
+def _parse_received(raw: str) -> dict:
+    """Extract address from the 'for' clause; keep full text as 'others' fallback."""
+    result: dict = {"others": raw}
+    m = re.search(r"\bfor\s+(<?[^\s>;\n]+@[^\s>;\n]+>?)", raw, re.I)
+    if m:
+        result["for"] = m.group(1)
+    return result
+
+
+class MailAdapter:
+    """Wraps email.message.Message with the attribute interface used by this module."""
+
+    def __init__(self, msg):
+        self._msg = msg
+        self.text_plain: list[str] = []
+        self.text_html: list[str] = []
+        self.attachments: list[dict] = []
+        self._from = _addr_list(msg, "from")
+        self.to = _addr_list(msg, "to")
+        self.cc = _addr_list(msg, "cc")
+        self.bcc = _addr_list(msg, "bcc")
+        self.delivered_to = _addr_list(msg, "delivered-to")
+        self.subject = _str_header(msg.get("subject") or "")
+        self.message_id = msg.get("message-id") or ""
+        self.auto_submitted = msg.get("auto-submitted") or ""
+        self.content_type = msg.get("content-type") or ""
+        self.date = self._parse_date()
+        self.received = [_parse_received(r) for r in msg.get_all("received") or []]
+        self._walk_parts()
+
+    def _parse_date(self):
+        raw = self._msg.get("date")
+        if not raw:
+            return None
+        try:
+            return parsedate_to_datetime(raw)
+        except Exception:
+            pass
+        try:
+            t = parsedate(raw)
+            if t:
+                return datetime.datetime(*t[:6])
+        except Exception:
+            pass
+        return None
+
+    def _decode_text_part(self, part) -> str | None:
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return None
+        charset = part.get_content_charset("utf-8") or "utf-8"
+        try:
+            return payload.decode(charset, errors="replace")
+        except LookupError:
+            return payload.decode("utf-8", errors="replace")
+
+    def _walk_parts(self):
+        for part in self._msg.walk():
+            if part.is_multipart():
+                continue
+            ctype = part.get_content_type()
+            cdisp = (part.get_content_disposition() or "").lower()
+            filename = part.get_filename()
+            content_id = part.get("content-id") or ""
+
+            is_attachment = False
+            if filename:
+                is_attachment = True
+            elif content_id and ctype not in ("text/plain", "text/html"):
+                is_attachment = True
+                filename = content_id
+            elif part.get_content_subtype() == "rtf":
+                is_attachment = True
+                filename = f"{uuid.uuid4().hex}.rtf"
+            elif cdisp == "attachment":
+                is_attachment = True
+                filename = f"{uuid.uuid4().hex}.txt"
+
+            if is_attachment:
+                payload = part.get_payload(decode=True)
+                if payload is not None:
+                    self.attachments.append({"filename": filename, "payload": payload})
+            elif ctype == "text/plain":
+                text = self._decode_text_part(part)
+                if text is not None:
+                    self.text_plain.append(text)
+            elif ctype == "text/html":
+                text = self._decode_text_part(part)
+                if text is not None:
+                    self.text_html.append(text)
+
+
+def parse_mail_from_bytes(raw_bytes: bytes) -> MailAdapter:
+    msg = BytesParser(policy=compat32).parsebytes(raw_bytes)
+    return MailAdapter(msg)
+
+
 def get_text(mail):
     raw_content, html_content, plain_content, html_quote, plain_quote = (
         "",
@@ -117,7 +217,6 @@ def get_text(mail):
     if mail.text_html:
         raw_content = "".join(mail.text_html).replace("\r\n", "\n")
         html_content, html_quote = strip_email_quote(raw_content)
-        # extract_from_html(raw_content)
         plain_content = html2text(html_content)
 
     if mail.text_plain or not plain_content:
@@ -125,9 +224,6 @@ def get_text(mail):
         plain_content = extract_non_quoted_from_plain(raw_content)
         plain_quote = exctract_quoted_from_plain(raw_content, plain_content)
 
-    # 'content' item holds plain_content and 'quote' item holds plain_quote
-    # (with HTML stripped off).
-    # These names are used for backward compatibility.
     return {
         "html_content": html_content,
         "content": plain_content,
@@ -176,24 +272,11 @@ def get_to_plus(mail):
 def get_attachments(mail):
     attachments = []
     for attachment in mail.attachments:
-        if attachment["content_transfer_encoding"] not in decoder_map:
-            msg = "Invalid Content-Transfer Encoding ({}) in msg {}.".format(
-                attachment["content_transfer_encoding"], mail.message_id
-            )
-            raise Exception(msg)
-        decoder = decoder_map[attachment["content_transfer_encoding"]]
-
         filename = attachment["filename"]
-
         try:
-            content = decoder(attachment["payload"])
-            attachments.append((filename, BytesIO(content), BINARY_MIME))
-        except (binascii.Error, ValueError):
-            print(
-                "Unable to parse attachment '{}' in {} \n".format(
-                    filename, mail.message_id
-                )
-            )
+            attachments.append((filename, BytesIO(attachment["payload"]), BINARY_MIME))
+        except Exception:
+            print(f"Unable to include attachment '{filename}' in {mail.message_id}\n")
     return attachments
 
 
@@ -208,48 +291,13 @@ def get_eml(raw_mail, compress_eml):
     return content
 
 
-def _has_any_email(x) -> bool:
-    if not x:
-        return False
-    # list/tuple of (name, email)
-    if isinstance(x, (list, tuple, set)):
-        for item in x:
-            if not item:
-                continue
-            if isinstance(item, (list, tuple)) and len(item) >= 2 and item[1]:
-                return True
-        return False
-    # string header
-    if isinstance(x, str):
-        return bool(x.strip())
-    # dict
-    if isinstance(x, dict):
-        return bool(x.get("email") or x.get("address") or x.get("From"))
-    return False
-
-
-def _pick_addresses(*candidates):
-    for c in candidates:
-        if _has_any_email(c):
-            return c
-    return None
-
-
 def get_manifest(mail, compress_eml):
-    from_source = _pick_addresses(
-        getattr(mail, "_from", None),  # prefer _from
-        getattr(mail, "from_", None),  # then from_
-        getattr(mail, "from", None),  # then from
-        getattr(mail, "headers", {}).get("From"),
-        getattr(mail, "mail", {}).get("from"),
-    )
-    from_result = extract_emails(from_source)
     return {
         "headers": {
             "subject": mail.subject,
             "to": extract_emails(mail.to),
             "to+": get_to_plus(mail),
-            "from": from_result,
+            "from": extract_emails(mail._from),
             "date": mail.date.isoformat() if mail.date else [],
             "cc": extract_emails(mail.cc),
             "message_id": mail.message_id,
@@ -262,124 +310,6 @@ def get_manifest(mail, compress_eml):
             "compressed": compress_eml,
         },
     }
-
-
-def _patch_addresses_from_stdlib(mp, raw_bytes):
-    """
-    Patch mp._from/mp.to/mp.cc when mailparser fails to parse addresses.
-    Uses Python stdlib email parsing as a reliable fallback.
-    """
-
-    def parse_msg(pol):
-        return BytesParser(policy=pol).parsebytes(raw_bytes)
-
-    def header_pairs(msg, name: str):
-        # getaddresses expects list of strings; stdlib may return header objects
-        # in some policies
-        vals = msg.get_all(name, []) or []
-        vals = [str(v) for v in vals]  # important: coerce Header/objects to str
-        pairs = getaddresses(vals)
-        return [(n, a) for (n, a) in pairs if a]
-
-    # Prefer default policy; fallback to compat32 if anything is weird
-    try:
-        msg = parse_msg(policy.default)
-        from_pairs = header_pairs(msg, "From")
-        to_pairs = header_pairs(msg, "To")
-        cc_pairs = header_pairs(msg, "Cc")
-    except Exception:
-        msg = parse_msg(compat32)
-        from_pairs = header_pairs(msg, "From")
-        to_pairs = header_pairs(msg, "To")
-        cc_pairs = header_pairs(msg, "Cc")
-
-    # Patch only if mailparser produced empty/invalid address tuples
-    if from_pairs and (
-        not getattr(mp, "_from", None) or all(not x[1] for x in mp._from if x)
-    ):
-        mp._from = from_pairs
-        if getattr(mp, "from_", None) is not None:
-            mp.from_ = from_pairs
-
-    if to_pairs and (not getattr(mp, "to", None) or all(not x[1] for x in mp.to if x)):
-        mp.to = to_pairs
-
-    if cc_pairs and (not getattr(mp, "cc", None) or all(not x[1] for x in mp.cc if x)):
-        mp.cc = cc_pairs
-
-    return mp
-
-
-def _coerce_header_objects_to_str(msg):
-    """
-    mailparser assumes Message.get(name) returns str/bytes.
-    Under some policies / Python versions, it can return email.header.Header.
-    Coerce those headers to plain strings in-place across all MIME parts.
-    """
-    for part in msg.walk():
-        # Only headers that mailparser touches early are strictly necessary,
-        # but doing all headers is safe and keeps behavior consistent.
-        for name in list(part.keys()):
-            val = part.get(name)
-            if isinstance(val, EmailHeader):
-                # Replace Header object with its string representation
-                del part[name]
-                part[name] = str(val)
-    return msg
-
-
-def parse_mail_from_bytes(raw_bytes):
-    """
-    Patch for mailparser bug.
-    Return a MailParser.MailParser object whose UTF-8 text parts are always
-    decoded correctly, even when the original message uses 7bit/8bit CTE.
-    """
-    try:
-        mp = mailparser.parse_from_bytes(raw_bytes)
-    except TypeError:
-        # Work around mailparser failing when a header value is an email.header.Header
-        # (observed on Python 3.14 with some messages having Content-Disposition etc.).
-        msg = BytesParser(policy=compat32).parsebytes(raw_bytes)
-        msg = _coerce_header_objects_to_str(msg)
-        mp = mailparser.core.MailParser(msg)
-
-    # Patch addresses if mailparser produced empty ones
-    mp = _patch_addresses_from_stdlib(mp, raw_bytes)
-
-    # Fast-exit if the message never uses 7bit/8bit encodings
-    _CTE_78BIT_RE = re.compile(rb"^Content-Transfer-Encoding:\s*[78]bit\b", re.I | re.M)
-    if not _CTE_78BIT_RE.search(raw_bytes):
-        return mp
-
-    # Re-parse with the std-lib email package
-    msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
-
-    plain_parts, html_parts, other_text_parts = [], [], []
-    for part in msg.walk():
-        if part.is_multipart():
-            continue
-        if part.get_content_maintype() != "text":
-            continue
-
-        txt = part.get_content()
-        ctype = part.get_content_type()
-        if ctype == "text/plain":
-            plain_parts.append(txt)
-        elif ctype == "text/html":
-            html_parts.append(txt)
-        else:
-            other_text_parts.append(txt)
-
-    # Patch MailParser’s internal lists
-    mp._text_plain = plain_parts
-    mp._text_html = html_parts
-    mp._text_not_managed = other_text_parts
-
-    # Invalidate the cached body so the property recomputes on demand
-    if hasattr(mp, "_body"):
-        mp._body = None
-
-    return mp
 
 
 def serialize_mail(raw_mail, compress_eml=False):
