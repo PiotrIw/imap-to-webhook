@@ -1426,6 +1426,37 @@ that this line is intact."""
         )
 
 
+    def test_outlook_forwarded_with_inline_images(self):
+        """
+        Real-world Outlook forward: reply text is separated from the quoted
+        forward block, and inline images are surfaced as attachments.
+        """
+        raw = get_email_as_bytes("Fw_ CloudHosting Enterprise dla biznesu.eml")
+        parts = serialize_mail(raw)
+        manifest = json.loads(
+            next(v for k, v in parts if k == "manifest")[1].read().decode("utf-8")
+        )
+        h = manifest["headers"]
+
+        self.assertEqual("test.user@company.eu", h["from"][0])
+        self.assertIn("test.user@gmail.com", h["to"])
+        self.assertEqual("Fw: CloudHosting Enterprise dla biznesu", h["subject"])
+        self.assertIsNone(h["auto_reply_type"])
+
+        # three inline images treated as attachments
+        self.assertEqual(3, manifest["files_count"])
+        attachments = [(k, v) for k, v in parts if k == "attachment"]
+        self.assertEqual(3, len(attachments))
+        filenames = [v[0] for _, v in attachments]
+        self.assertIn("attachment_0.jpg", filenames)
+
+        # Outlook forward quote is detected; reply body is separated
+        text = manifest["text"]
+        self.assertIn("Pozdrawiam", text["content"])
+        self.assertNotIn("Pozdrawiam", text["quote"])
+        self.assertIn("nazwa.pl", text["quote"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
     # unittest.main(verbosity=2, defaultTest="TestMain.test_8bit_text_html")
