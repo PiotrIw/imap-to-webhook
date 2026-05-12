@@ -114,6 +114,28 @@ class TestMain(unittest.TestCase):
         self.assertEqual("OR.1434.76.2025 fedrowanie.pdf", filename)
         self.assertGreater(len(content_io.read()), 0)
 
+    def test_attachment_rfc2047_encoded_name(self):
+        """
+        Attachment whose filename is RFC2047-encoded in Content-Type: name= (no
+        Content-Disposition filename= parameter) must be decoded to plain Unicode.
+        """
+        raw = get_email_as_bytes("us_augustow.eml")
+        parts = serialize_mail(raw)
+        manifest = json.loads(
+            next(v for k, v in parts if k == "manifest")[1].read().decode("utf-8")
+        )
+        self.assertEqual(1, manifest["files_count"])
+
+        attachments = [(k, v) for k, v in parts if k == "attachment"]
+        self.assertEqual(1, len(attachments))
+        filename, content_io, _mime = attachments[0][1]
+        self.assertEqual(
+            "Odpowiedź na wniosek o udostępnienie informacji publicznej"
+            " - Sieć Obywatelska Watchdog Polska.docx.pdf",
+            filename,
+        )
+        self.assertGreater(len(content_io.read()), 0)
+
     def test_eml_compression(self):
         """
         compress_eml=True produces a gzip-compressed eml that round-trips
