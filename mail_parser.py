@@ -173,6 +173,9 @@ class MailAdapter:
             filename = part.get_filename()
             content_id = part.get("content-id") or ""
 
+            if filename:
+                filename = _str_header(filename)
+
             is_attachment = False
             if filename:
                 is_attachment = True
@@ -306,6 +309,7 @@ def get_manifest(mail, compress_eml):
         "version": "v2",
         "text": get_text(mail),
         "files_count": len(mail.attachments),
+        "file_names": [{"filename": att["filename"]} for att in mail.attachments],
         "eml": {
             "compressed": compress_eml,
         },
